@@ -1,4 +1,3 @@
-// routes/bills.js
 const express = require('express');
 const router = express.Router();
 const upload = require('../middleware/upload');
@@ -6,178 +5,158 @@ const PDFProcessor = require('../services/pdfProcessor');
 const ComparisonService = require('../services/comparisonService');
 const fs = require('fs').promises;
 
+/**
+ * POST /api/bills/compare
+ * multipart/form-data with field 'bill' (pdf file) and form field 'targetProvider' (e.g., 'oci')
+ */
 router.post('/compare', upload.single('bill'), async (req, res) => {
+  let tmpPath = null;
   try {
-    if (!req.file) return res.status(400).json({ error: 'No PDF file uploaded' });
+    if (!req.file) return res.status(400).json({ error: 'No PDF file uploaded (field: bill)' });
 
+    tmpPath = req.file.path;
     const { targetProvider } = req.body;
-    if (!targetProvider) return res.status(400).json({ error: 'Target provider is required' });
+    if (!targetProvider) return res.status(400).json({ error: 'Target provider is required (form field: targetProvider)' });
 
-    const billData = await PDFProcessor.extractTextFromPDF(req.file.path);
+    // 1) Extract structured bill from PDF
+    const billData = await PDFProcessor.extractTextFromPDF(tmpPath);
+
+    // 2) Compare with target provider
     const comparisonResult = await ComparisonService.compareWithProvider(billData, targetProvider);
 
-    await fs.unlink(req.file.path);
+    // 3) Only target services (no AWS duplication here)
+    const targetServices = (comparisonResult.serviceComparisons || []).map(s => ({
+      targetService: s.mappedService || null,
+      targetCost: s.estimatedCost,
+      mappingStatus: s.mappingStatus,
+      pricingDetails: s.pricingDetails || null,
+      usageDetails: s.usageDetails || null,
+      conversionFactor: s.conversionFactor || 1,
+      message: s.message || null
+    }));
 
-    const formatted = {
+    // 4) Summary (AWS vs target) → still useful
+    const comparisonSummary = (comparisonResult.serviceComparisons || []).map(s => ({
+      sourceService: s.serviceName,
+      targetService: s.mappedService || null,
+      sourceCost: s.originalCost,
+      targetCost: s.estimatedCost,
+      savings: round2((s.originalCost || 0) - (s.estimatedCost || 0)),
+      percentageSavings: s.percentageSavings || null,
+      status: s.mappingStatus
+    }));
+
+    const response = {
       success: true,
-      comparison: formatComparisonResponse(comparisonResult),
-      tables: {
-        extractedBill: formatExtractedBillTable(billData),
-        comparisonSummary: formatComparisonSummaryTable(comparisonResult),
-        serviceComparison: formatServiceComparisonTable(comparisonResult),
-        savingsBreakdown: formatSavingsBreakdownTable(comparisonResult)
-      }
+      source_provider: billData.provider || 'aws',
+      source_extraction: billData, // ✅ only AWS data
+      target_provider_mapping: {
+        targetProvider: comparisonResult.targetProvider,
+        services: targetServices // ✅ only target info
+      },
+      comparison_summary: comparisonSummary,
+      totals: {
+        sourceTotal: comparisonResult.totalOriginalCost,
+        targetTotal: comparisonResult.totalEstimatedCost,
+        savings: comparisonResult.potentialSavings,
+        savingsPercentage: comparisonResult.savingsPercentage,
+        isCheaper: comparisonResult.isCheaper
+      },
+      metadata: comparisonResult.metadata || billData.metadata || {},
+      comparisonDate: comparisonResult.comparisonDate,
+      currency: comparisonResult.currency || 'USD'
     };
 
-    res.json(formatted);
+    // delete temp file
+    try { await fs.unlink(tmpPath); } catch (e) { /* ignore */ }
+
+    res.json(response);
   } catch (error) {
     console.error('Comparison error:', error);
-    if (req.file) {
-      try { await fs.unlink(req.file.path); } catch {}
+    if (tmpPath) {
+      try { await fs.unlink(tmpPath); } catch (e) { /* ignore */ }
     }
     res.status(500).json({ error: 'Failed to process comparison', message: error.message });
   }
 });
 
-router.post('/compare-multiple', upload.single('bill'), async (req, res) => {
-  try {
-    if (!req.file) return res.status(400).json({ error: 'No PDF file uploaded' });
 
-    const { providers } = req.body;
-    if (!providers || !Array.isArray(providers)) {
-      return res.status(400).json({ error: 'Providers array is required' });
+/**
+ * POST /api/bills/compare-multiple
+ * multipart/form-data with field 'bill' and form field 'providers' as JSON string or multiple repeated 'providers' fields
+ * Example providers body: providers=["oci","azure"]
+ */
+router.post('/compare-multiple', upload.single('bill'), async (req, res) => {
+  let tmpPath = null;
+  try {
+    if (!req.file) return res.status(400).json({ error: 'No PDF file uploaded (field: bill)' });
+
+    tmpPath = req.file.path;
+
+    let providers = [];
+    if (req.body.providers) {
+      try {
+        providers = typeof req.body.providers === 'string'
+          ? JSON.parse(req.body.providers)
+          : req.body.providers;
+      } catch {
+        providers = (req.body.providers || '').split(',').map(p => p.trim()).filter(Boolean);
+      }
+    } else if (req.body.provider) {
+      providers = [req.body.provider];
     }
 
-    const billData = await PDFProcessor.extractTextFromPDF(req.file.path);
+    if (!Array.isArray(providers) || providers.length === 0) {
+      return res.status(400).json({ error: 'Providers array is required (form field: providers)' });
+    }
+
+    // Extract bill once
+    const billData = await PDFProcessor.extractTextFromPDF(tmpPath);
+
+    // Run comparisons for each provider
     const comparisons = {};
     for (const p of providers) {
-      comparisons[p] = await ComparisonService.compareWithProvider(billData, p);
+      const cmp = await ComparisonService.compareWithProvider(billData, p);
+
+      // ✅ only target services
+      const targetServices = (cmp.serviceComparisons || []).map(s => ({
+        targetService: s.mappedService || null,
+        targetCost: s.estimatedCost,
+        mappingStatus: s.mappingStatus,
+        usageDetails: s.usageDetails || null
+      }));
+
+      comparisons[p] = {
+        targetProvider: p,
+        services: targetServices,
+        totals: {
+          sourceTotal: cmp.totalOriginalCost,
+          targetTotal: cmp.totalEstimatedCost,
+          savings: cmp.potentialSavings,
+          savingsPercentage: cmp.savingsPercentage,
+          isCheaper: cmp.isCheaper
+        }
+      };
     }
 
-    await fs.unlink(req.file.path);
+    try { await fs.unlink(tmpPath); } catch (e) { /* ignore */ }
 
     res.json({
       success: true,
-      comparisons,
-      extractedBill: formatExtractedBillTable(billData)
+      source_provider: billData.provider || 'aws',
+      source_extraction: billData, // ✅ AWS data only
+      comparisons
     });
   } catch (error) {
     console.error('Multiple comparison error:', error);
+    if (tmpPath) {
+      try { await fs.unlink(tmpPath); } catch (e) { /* ignore */ }
+    }
     res.status(500).json({ error: 'Failed to process multiple comparisons', message: error.message });
   }
 });
 
-function formatComparisonResponse(r) {
-  return {
-    originalProvider: r.originalProvider,
-    targetProvider: r.targetProvider,
-    totalOriginalCost: r.totalOriginalCost,
-    totalEstimatedCost: r.totalEstimatedCost,
-    potentialSavings: r.potentialSavings,
-    savingsPercentage: r.savingsPercentage,
-    isCheaper: r.isCheaper,
-    currency: r.currency,
-    comparisonDate: r.comparisonDate,
-    metadata: r.metadata
-  };
-}
 
-function formatExtractedBillTable(billData) {
-  return {
-    title: `Extracted ${billData.provider.toUpperCase()} Bill Details`,
-    columns: [
-      { key: 'serviceName', title: 'Service Name' },
-      { key: 'cost', title: 'Cost (USD)', type: 'currency' },
-      { key: 'usageHours', title: 'Usage Hours', type: 'number' },
-      { key: 'usageGB', title: 'Usage GB', type: 'number' },
-      { key: 'usageRequests', title: 'Requests', type: 'number' },
-      { key: 'region', title: 'Region' },
-      { key: 'instanceType', title: 'Instance Type' }
-    ],
-    rows: billData.services.map(s => ({
-      serviceName: s.name,
-      cost: s.cost,
-      usageHours: s.usage?.hours || 0,
-      usageGB: s.usage?.gb || 0,
-      usageRequests: s.usage?.requests || 0,
-      region: s.region || 'N/A',
-      instanceType: s.instanceType || 'N/A'
-    })),
-    summary: {
-      totalCost: billData.totalAmount,
-      totalServices: billData.services.length,
-      billingPeriod: billData.metadata?.billingPeriod
-    }
-  };
-}
-
-function formatComparisonSummaryTable(r) {
-  return {
-    title: 'Cost Comparison Summary',
-    columns: [
-      { key: 'metric', title: 'Metric' },
-      { key: 'source', title: r.originalProvider.toUpperCase(), type: 'currency' },
-      { key: 'target', title: r.targetProvider.toUpperCase(), type: 'currency' },
-      { key: 'difference', title: 'Difference', type: 'currency' }
-    ],
-    rows: [
-      { metric: 'Total Monthly Cost', source: r.totalOriginalCost, target: r.totalEstimatedCost, difference: r.potentialSavings },
-      { metric: 'Savings Percentage', source: '-', target: '-', difference: `${r.savingsPercentage}%` }
-    ]
-  };
-}
-
-function formatServiceComparisonTable(r) {
-  return {
-    title: 'Service-by-Service Comparison',
-    columns: [
-      { key: 'srcService', title: `${r.originalProvider.toUpperCase()} Service` },
-      { key: 'targetService', title: `${r.targetProvider.toUpperCase()} Service` },
-      { key: 'srcCost', title: `${r.originalProvider.toUpperCase()} Cost`, type: 'currency' },
-      { key: 'targetCost', title: 'Target Cost', type: 'currency' },
-      { key: 'savings', title: 'Savings', type: 'currency' },
-      { key: 'status', title: 'Status' }
-    ],
-    rows: r.serviceComparisons.map(s => ({
-      srcService: s.serviceName,
-      targetService: s.mappedService || 'Not Available',
-      srcCost: s.originalCost,
-      targetCost: s.estimatedCost,
-      savings: (s.originalCost || 0) - (s.estimatedCost || 0),
-      status: s.mappingStatus,
-      hasSavings: (s.estimatedCost || 0) < (s.originalCost || 0)
-    }))
-  };
-}
-
-function formatSavingsBreakdownTable(r) {
-  const rows = r.serviceComparisons
-    .filter(s => s.mappingStatus === 'success' && (s.estimatedCost || 0) < (s.originalCost || 0))
-    .sort((a, b) => ((b.originalCost - b.estimatedCost) - (a.originalCost - a.estimatedCost)))
-    .map(s => {
-      const monthly = (s.originalCost || 0) - (s.estimatedCost || 0);
-      return {
-        service: s.serviceName,
-        awsCost: s.originalCost,
-        targetCost: s.estimatedCost,
-        monthlySavings: monthly,
-        annualSavings: monthly * 12,
-        savingsPercentage: `${(s.percentageSavings || 0).toFixed(1)}%`
-      };
-    });
-
-  return {
-    title: 'Top Savings Opportunities',
-    columns: [
-      { key: 'service', title: 'Service' },
-      { key: 'awsCost', title: 'Source Cost', type: 'currency' },
-      { key: 'targetCost', title: 'Target Cost', type: 'currency' },
-      { key: 'monthlySavings', title: 'Monthly Savings', type: 'currency' },
-      { key: 'annualSavings', title: 'Annual Savings', type: 'currency' },
-      { key: 'savingsPercentage', title: 'Savings %' }
-    ],
-    rows
-  };
-}
+function round2(n) { return Math.round((Number(n) || 0) * 100) / 100; }
 
 module.exports = router;

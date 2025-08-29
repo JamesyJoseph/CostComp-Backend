@@ -1,4 +1,3 @@
-// services/comparisonService.js
 const DatabaseService = require('./databaseService');
 const { mapRegion } = require('./serviceDictionary');
 
@@ -51,116 +50,107 @@ class ComparisonService {
   }
 
   async compareService(sourceService, sourceProvider, targetProvider, targetProviderId) {
-  try {
-    // 1️⃣ Try to find service mapping
-    const mapping = await DatabaseService.findServiceMapping(
-      targetProvider,
-      sourceService.canonical || sourceService.name,
-      sourceProvider
-    );
+    try {
+      const mapping = await DatabaseService.findServiceMapping(
+        targetProvider,
+        sourceService.canonical || sourceService.name,
+        sourceProvider
+      );
 
-    // 2️⃣ If no mapping, use fallback cost (optional)
-    if (!mapping) {
-      const fallbackCost = sourceService.cost || 0; // could also be some default rate
+      if (!mapping) {
+        const fallbackCost = sourceService.cost || 0;
+        return {
+          serviceName: sourceService.name,
+          mappedService: null,
+          service_type: 'Unknown',
+          originalCost: round2(sourceService.cost),
+          estimatedCost: round2(fallbackCost),
+          absoluteSavings: round2(sourceService.cost - fallbackCost),
+          percentageSavings: null,
+          isCheaper: false,
+          mappingStatus: 'not_mapped_fallback',
+          message: `No equivalent service found for ${sourceService.name} in ${targetProvider}. Using fallback (source cost).`,
+          usageDetails: sourceService.usage || {},
+          conversionFactor: 1,
+          pricingDetails: null
+        };
+      }
+
+      const targetRegion = mapRegion(sourceProvider, sourceService.region, targetProvider);
+
+      const pricing = await DatabaseService.getCurrentPricing(
+        targetProviderId,
+        mapping.id,
+        targetRegion
+      );
+
+      let estimatedCost = 0;
+      let pricingDetails = null;
+      if (pricing) {
+        estimatedCost = this.calculateEstimatedCost(sourceService.usage, pricing, mapping.conversion_factor);
+        pricingDetails = {
+          pricePerHour: nullableFloat(pricing.price_per_hour),
+          pricePerGB: nullableFloat(pricing.price_per_gb),
+          pricePerRequest: nullableFloat(pricing.price_per_request),
+          region: pricing.region,
+          instanceType: pricing.instance_type,
+          currency: pricing.currency || 'USD'
+        };
+      } else {
+        const fallbackPricing = {
+          price_per_hour: 0.1,
+          price_per_gb: 0.01,
+          price_per_request: 0.001,
+          currency: 'USD'
+        };
+        estimatedCost = this.calculateEstimatedCost(sourceService.usage, fallbackPricing, mapping.conversion_factor);
+      }
+
+      const savings = (sourceService.cost || 0) - estimatedCost;
+      const pct = (sourceService.cost || 0) > 0 ? (savings / sourceService.cost) * 100 : null;
+
       return {
         serviceName: sourceService.name,
-        mappedService: null,
-        serviceType: 'Unknown',
+        mappedService: mapping.provider_service_name,
+        service_type: mapping.service_type,
         originalCost: round2(sourceService.cost),
-        estimatedCost: round2(fallbackCost),
-        absoluteSavings: round2(sourceService.cost - fallbackCost),
-        percentageSavings: 100,
-        isCheaper: false,
-        mappingStatus: 'not_mapped_fallback',
-        message: `No equivalent service found for ${sourceService.name} in ${targetProvider}. Using fallback cost.`,
-        usageDetails: sourceService.usage
+        estimatedCost: round2(estimatedCost),
+        absoluteSavings: round2(savings),
+        percentageSavings: pct !== null ? round2(pct) : null,
+        isCheaper: estimatedCost < (sourceService.cost || 0),
+        mappingStatus: pricing ? 'success' : 'mapped_no_pricing_fallback',
+        pricingDetails,
+        usageDetails: sourceService.usage || {},
+        conversionFactor: mapping.conversion_factor || 1,
+        message: pricing ? 'Pricing found and applied' : `No pricing data for ${mapping.provider_service_name} in ${targetRegion}. Applied fallback rates.`
+      };
+    } catch (error) {
+      console.error('Service comparison error:', error);
+      return {
+        serviceName: sourceService.name,
+        originalCost: round2(sourceService.cost),
+        estimatedCost: 0,
+        mappingStatus: 'error',
+        message: `Error comparing service: ${error.message}`,
+        usageDetails: sourceService.usage || {}
       };
     }
-
-    // 3️⃣ Map region
-    const targetRegion = mapRegion(sourceProvider, sourceService.region, targetProvider);
-
-    // 4️⃣ Get pricing from DB
-    const pricing = await DatabaseService.getCurrentPricing(
-      targetProviderId,
-      mapping.id,
-      targetRegion
-    );
-
-    // 5️⃣ Calculate estimated cost
-    let estimatedCost = 0;
-    if (pricing) {
-      estimatedCost = this.calculateEstimatedCost(sourceService.usage, pricing, mapping.conversion_factor);
-    } else {
-      // Use fallback pricing if DB pricing missing
-      const fallbackPricing = {
-        price_per_hour: 0.1,    // example default
-        price_per_gb: 0.01,
-        price_per_request: 0.001,
-        currency: 'USD'
-      };
-      estimatedCost = this.calculateEstimatedCost(sourceService.usage, fallbackPricing, mapping.conversion_factor);
-    }
-
-    // 6️⃣ Calculate savings
-    const savings = (sourceService.cost || 0) - estimatedCost;
-    const pct = (sourceService.cost || 0) > 0 ? (savings / sourceService.cost) * 100 : 0;
-
-    // 7️⃣ Return final comparison object
-    return {
-      serviceName: sourceService.name,
-      mappedService: mapping.provider_service_name,
-      serviceType: mapping.service_type,
-      originalCost: round2(sourceService.cost),
-      estimatedCost: round2(estimatedCost),
-      absoluteSavings: round2(savings),
-      percentageSavings: round2(pct),
-      isCheaper: estimatedCost < (sourceService.cost || 0),
-      mappingStatus: pricing ? 'success' : 'mapped_no_pricing_fallback',
-      pricingDetails: pricing
-        ? {
-            pricePerHour: nullableFloat(pricing.price_per_hour),
-            pricePerGB: nullableFloat(pricing.price_per_gb),
-            pricePerRequest: nullableFloat(pricing.price_per_request),
-            region: pricing.region,
-            instanceType: pricing.instance_type,
-            currency: pricing.currency || 'USD'
-          }
-        : null,
-      usageDetails: sourceService.usage,
-      conversionFactor: mapping.conversion_factor || 1,
-      message: pricing
-        ? 'Pricing found and applied'
-        : `No pricing data for ${mapping.provider_service_name} in ${targetRegion}. Applied fallback rates.`
-    };
-  } catch (error) {
-    console.error('Service comparison error:', error);
-    return {
-      serviceName: sourceService.name,
-      originalCost: round2(sourceService.cost),
-      estimatedCost: 0,
-      mappingStatus: 'error',
-      message: `Error comparing service: ${error.message}`,
-      usageDetails: sourceService.usage
-    };
   }
-}
 
   calculateEstimatedCost(usage, pricing, conversionFactor = 1.0) {
     const cf = parseFloat(conversionFactor || 1);
     let cost = 0;
 
-    const pph = nullableFloat(pricing.price_per_hour);
-    const ppgb = nullableFloat(pricing.price_per_gb);
-    const ppreq = nullableFloat(pricing.price_per_request);
+    const pph = nullableFloat(pricing.price_per_hour || pricing.price_per_hr || pricing.price_per_hour);
+    const ppgb = nullableFloat(pricing.price_per_gb || pricing.price_per_gb);
+    const ppreq = nullableFloat(pricing.price_per_request || pricing.price_per_request);
 
     if (usage?.hours && pph) cost += usage.hours * pph;
-    if (usage?.vcpuHours && pph) cost += usage.vcpuHours * pph; // optional, if you price vCPU-hours
+    if (usage?.vcpuHours && pph) cost += usage.vcpuHours * pph;
     if (usage?.gb && ppgb) cost += usage.gb * ppgb;
     if (usage?.requests && ppreq) cost += usage.requests * ppreq;
 
     if (usage?.instances && usage.instances > 1 && (pph || ppgb || ppreq)) {
-      // if instances denote same pattern repeated
       cost *= usage.instances;
     }
     return cost * cf;
